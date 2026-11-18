@@ -35,10 +35,97 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    limits = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    issues = []
+    for image_file in ds.image_files():
+        stem = image_file.stem
+        if stem not in preds:
+            continue
+        label_lines = ds.read_label_lines(stem)
+        if label_lines is None:
+            continue
+        image_size = ds.image_size(stem)
+        if image_size is None:
+            continue
+        image_width, image_height = image_size
+
+        # Parse một lần và giữ số dòng gốc để báo FALSE_POS đúng vị trí.
+        labels = []
+        for line, text in label_lines:
+            try:
+                box = parse_yolo_line(text)
+            except (ValueError, OverflowError):
+                continue
+            if 0 <= box[0] < len(ds.classes):
+                labels.append((line, box))
+
+        image_preds = preds[stem]
+        for pred in image_preds:
+            pred_class, confidence = pred[:2]
+            pred_box = pred[2:]
+            area_px = pred_box[2] * image_width * pred_box[3] * image_height
+            if confidence < limits["conf"] or area_px < limits["min_area_px"]:
+                continue
+
+            candidates = []
+            for _, label in labels:
+                overlap = iou_xywh(pred_box, label[1:])
+                if overlap >= limits["iou_missing"]:
+                    candidates.append((overlap, label))
+
+            if not candidates:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    f"model thấy vật lớp {pred_class} nhưng không có box nhãn khớp",
+                    extra={"conf": confidence},
+                ))
+                continue
+
+            same_class = [(overlap, label) for overlap, label in candidates
+                          if label[0] == pred_class]
+            if same_class:
+                best_iou = max(overlap for overlap, _ in same_class)
+                if best_iou < limits["iou_loose"]:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        f"box cùng lớp {pred_class} có IoU {best_iou:.3f}, "
+                        f"dưới ngưỡng {limits['iou_loose']:g}",
+                        extra={"conf": confidence, "iou": best_iou},
+                    ))
+                # Nhãn cùng lớp đã phủ vật: không xét nhầm lớp cho dự đoán này.
+                continue
+
+            best_iou, best_label = max(candidates, key=lambda candidate: candidate[0])
+            if best_iou >= limits["iou_match"]:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                    f"model dự đoán lớp {pred_class}, nhãn là lớp {best_label[0]}, "
+                    f"IoU {best_iou:.3f}",
+                    extra={"conf": confidence, "iou": best_iou},
+                ))
+
+        # FALSE_POS dùng ngưỡng riêng, không bỏ dự đoán nhỏ hoặc khác lớp.
+        matching_preds = [pred for pred in image_preds
+                          if pred[1] >= limits["fp_conf"]]
+        for line, label in labels:
+            best_iou = max(
+                (iou_xywh(label[1:], pred[2:]) for pred in matching_preds),
+                default=0.0,
+            )
+            if best_iou < limits["iou_missing"]:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    f"box nhãn không khớp dự đoán nào đủ tin cậy; "
+                    f"IoU tốt nhất {best_iou:.3f}",
+                    line, {"iou": best_iou},
+                ))
+
+    return issues
